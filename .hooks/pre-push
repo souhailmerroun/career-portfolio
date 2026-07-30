@@ -18,7 +18,12 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   fi
 
   # 2. Block force-push / history rewrite on any branch.
+  #    A new branch has no remote sha yet; a deletion has no local one. Neither is
+  #    a rewrite, and deleting main/master is already refused by check 1 above, so
+  #    both pass straight through. Without the second line, `git push --delete`
+  #    reads as erasing history and merged branches pile up on the remote.
   [ "$remote_sha" = "0000000000000000000000000000000000000000" ] && continue
+  [ "$local_sha" = "0000000000000000000000000000000000000000" ] && continue
   if ! git merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
     echo "[pre-push] ✗ $repo → $branch: force push blocked — would erase history"
     exit 1
