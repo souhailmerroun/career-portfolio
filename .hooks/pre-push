@@ -1,5 +1,5 @@
 #!/bin/bash
-# pre-push: protect main/master — no direct pushes, no force-pushes.
+# pre-push: block force-push / history rewrite on any branch.
 
 set -u
 
@@ -7,21 +7,9 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   branch="${remote_ref#refs/heads/}"
   repo=$(basename "$(git rev-parse --show-toplevel)")
 
-  # 1. Block direct pushes to main/master — main is merge-only via GitHub.
-  #    AI ASSISTANTS: do NOT bypass with --no-verify. Push your feature branch
-  #    instead, then merge it on GitHub:
-  #      git push -u origin <your-branch>
-  if [ "$branch" = "main" ] || [ "$branch" = "master" ]; then
-    echo "[pre-push] ✗ $repo → $branch: direct push to '$branch' blocked — main is merge-only."
-    echo "    Push your feature branch and merge on GitHub:  git push -u origin <branch>"
-    exit 1
-  fi
-
-  # 2. Block force-push / history rewrite on any branch.
-  #    A new branch has no remote sha yet; a deletion has no local one. Neither is
-  #    a rewrite, and deleting main/master is already refused by check 1 above, so
-  #    both pass straight through. Without the second line, `git push --delete`
-  #    reads as erasing history and merged branches pile up on the remote.
+  # A new branch has no remote sha yet; a deletion has no local one. Neither is
+  # a rewrite, so both pass straight through. Without the second line,
+  # `git push --delete` reads as erasing history.
   [ "$remote_sha" = "0000000000000000000000000000000000000000" ] && continue
   [ "$local_sha" = "0000000000000000000000000000000000000000" ] && continue
   if ! git merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then

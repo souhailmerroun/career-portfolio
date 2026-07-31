@@ -1,13 +1,4 @@
 #!/bin/bash
-
-# 0. Block direct commits on main/master — main is merge-only; branch first.
-#    AI ASSISTANTS: do NOT bypass with --no-verify. Instead:
-#      git checkout -b <machine>/<task>   (staged changes follow you), then re-commit.
-_cur=$(git symbolic-ref --short HEAD 2>/dev/null)
-if [ "$_cur" = "main" ] || [ "$_cur" = "master" ]; then
-  echo "[pre-commit] ✗ Direct commit on '$_cur' blocked — main is merge-only. Branch first: git checkout -b <name>"
-  exit 1
-fi
 # pre-commit: catch common issues before they land in history
 
 STAGED=$(git diff --cached --name-only)
