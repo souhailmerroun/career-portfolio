@@ -1,0 +1,5 @@
+overrides:
+  # next hard-pins postcss 8.4.31, which carries GHSA path-traversal and
+  # arbitrary-file-read advisories, patched >=8.5.18. No next release lifts
+  # the pin, so force it here.
+  postcss: '^8.5.18'
