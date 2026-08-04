@@ -3,3 +3,8 @@ overrides:
   # arbitrary-file-read advisories, patched >=8.5.18. No next release lifts
   # the pin, so force it here.
   postcss: '^8.5.18'
+  # next pins sharp ^0.34.5, which caps below 0.35.0 and inherits the libvips
+  # advisories CVE-2026-33327, CVE-2026-33328, CVE-2026-35590 and
+  # CVE-2026-35591 (GHSA-f88m-g3jw-g9cj). No next release lifts the pin, so
+  # force it here.
+  sharp: '^0.35.3'
