@@ -1,11 +1,29 @@
 #!/bin/bash
 # pre-commit: catch common issues before they land in history
+#
+# Every per-file check below is BATCHED — one process for the whole staged set,
+# not one per file. A commit of 71,697 JSON records ran this hook for over an
+# hour when each file got its own `python3 -m json.tool`; the same set now
+# validates in a single interpreter. Keep it that way: a `while read … do
+# <command> "$f" … done` loop over the staged list is the thing to avoid, since
+# its cost is a process spawn multiplied by however large a commit ever gets.
 
 STAGED=$(git diff --cached --name-only)
 FAIL=0
 
 repo=$(basename "$(git rev-parse --show-toplevel)")
 echo "[pre-commit] $repo"
+
+TMPD=$(mktemp -d)
+trap 'rm -rf "$TMPD"' EXIT
+
+# Staged paths that exist on disk, NUL-delimited so filenames with spaces or
+# newlines survive being handed to xargs. Built with shell builtins only.
+EXISTING="$TMPD/existing"
+: > "$EXISTING"
+while IFS= read -r f; do
+  [ -f "$f" ] && printf '%s\0' "$f"
+done <<< "$STAGED" >> "$EXISTING"
 
 # 1. Block .env files
 if echo "$STAGED" | grep -qE '^\.env(\..+)?$'; then
@@ -26,34 +44,51 @@ if [ -n "$tracked_ds" ]; then
   FAIL=1
 fi
 
-# 3. Merge conflict markers
-while IFS= read -r f; do
-  [ -f "$f" ] || continue
-  if grep -qE '^<<<<<<< |^=======$|^>>>>>>> ' "$f"; then
-    echo "[pre-commit] ✗ Conflict markers in: $f"
+# 3. Merge conflict markers — one grep over the whole set, listing only matches
+if [ -s "$EXISTING" ]; then
+  conflicts=$(xargs -0 grep -lE '^<<<<<<< |^=======$|^>>>>>>> ' < "$EXISTING" 2>/dev/null)
+  if [ -n "$conflicts" ]; then
+    echo "$conflicts" | while IFS= read -r f; do
+      echo "[pre-commit] ✗ Conflict markers in: $f"
+    done
     FAIL=1
   fi
-done <<< "$STAGED"
+fi
 
-# 4. Validate staged JSON files
-while IFS= read -r f; do
-  [ -f "$f" ] || continue
-  if ! python3 -m json.tool "$f" >/dev/null 2>&1; then
-    echo "[pre-commit] ✗ Invalid JSON: $f"
+# 4. Validate staged JSON — one interpreter for every file, not one each
+tr '\0' '\n' < "$EXISTING" | grep '\.json$' > "$TMPD/json"
+if [ -s "$TMPD/json" ]; then
+  bad_json=$(python3 -c '
+import json, sys
+for line in open(sys.argv[1], encoding="utf-8"):
+    path = line.rstrip("\n")
+    if not path:
+        continue
+    try:
+        with open(path, "rb") as fh:
+            json.load(fh)
+    except Exception:
+        print(path)
+' "$TMPD/json")
+  if [ -n "$bad_json" ]; then
+    echo "$bad_json" | while IFS= read -r f; do
+      echo "[pre-commit] ✗ Invalid JSON: $f"
+    done
     FAIL=1
   fi
-done < <(echo "$STAGED" | grep '\.json$')
+fi
 
-# 5. Block large files >10MB
-while IFS= read -r f; do
-  [ -f "$f" ] || continue
-  size=$(wc -c < "$f")
-  if [ "$size" -gt 10485760 ]; then
-    mb=$(( size / 1024 / 1024 ))
-    echo "[pre-commit] ✗ Large file blocked (${mb}MB): $f — add to .gitignore?"
+# 5. Block large files >10MB — one stat over the set
+if [ -s "$EXISTING" ]; then
+  large=$(xargs -0 stat -f '%z %N' < "$EXISTING" 2>/dev/null \
+          | awk '$1 > 10485760 { mb = int($1/1048576); $1 = ""; sub(/^ /, ""); print mb"\t"$0 }')
+  if [ -n "$large" ]; then
+    echo "$large" | while IFS=$'\t' read -r mb f; do
+      echo "[pre-commit] ✗ Large file blocked (${mb}MB): $f — add to .gitignore?"
+    done
     FAIL=1
   fi
-done <<< "$STAGED"
+fi
 
 # 6. Common secret patterns in staged diff
 if git diff --cached | grep '^+' | grep -v '^+++' | grep -qE '(AKIA[A-Z0-9]{16}|ghp_[a-zA-Z0-9]{36}|xoxb-[a-zA-Z0-9-]+|sk-[a-zA-Z0-9]{40,})'; then
@@ -117,24 +152,39 @@ done < <(echo "$STAGED" | grep '\.html$')
 # 8. File length — warn at recommended limit, block at hard limit
 # Recommended: aim to split before hitting these
 # Hard block: truly unmanageable, must split before committing
-declare_limits() {
-  echo "js:300:1500 ts:300:1500 jsx:300:1500 tsx:300:1500 py:300:1500 html:150:600 css:400:2000 scss:400:2000 sh:200:500"
-}
-while IFS= read -r f; do
-  [ -f "$f" ] || continue
-  ext="${f##*.}"
-  limits=$(declare_limits | tr ' ' '\n' | grep "^${ext}:" | head -1)
-  [ -z "$limits" ] && continue
-  recommended=$(echo "$limits" | cut -d: -f2)
-  hard=$(echo "$limits" | cut -d: -f3)
-  lines=$(wc -l < "$f")
-  if [ "$lines" -gt "$hard" ]; then
-    echo "[pre-commit] ✗ $f is $lines lines (hard limit: $hard for .$ext) — must split before committing"
-    FAIL=1
-  elif [ "$lines" -gt "$recommended" ]; then
-    echo "[pre-commit] ⚠ $f is $lines lines (recommended: $recommended for .$ext) — consider splitting"
+# One `wc -l` over every source file at once; awk applies the per-extension limits.
+LIMITS="js:300:1500 ts:300:1500 jsx:300:1500 tsx:300:1500 py:300:1500 html:150:600 css:400:2000 scss:400:2000 sh:200:500"
+tr '\0' '\n' < "$EXISTING" | grep -E '\.(js|ts|jsx|tsx|py|html|css|scss|sh)$' > "$TMPD/code"
+if [ -s "$TMPD/code" ]; then
+  lengths=$(tr '\n' '\0' < "$TMPD/code" | xargs -0 wc -l 2>/dev/null | grep -v ' total$')
+  report=$(echo "$lengths" | awk -v limits="$LIMITS" '
+    BEGIN {
+      n = split(limits, pairs, " ")
+      for (i = 1; i <= n; i++) {
+        split(pairs[i], p, ":")
+        rec[p[1]] = p[2]; hard[p[1]] = p[3]
+      }
+    }
+    {
+      lines = $1
+      $1 = ""; sub(/^ /, ""); path = $0
+      ext = path; sub(/.*\./, "", ext)
+      if (!(ext in rec)) next
+      if (lines > hard[ext]) print "✗\t" path "\t" lines "\t" hard[ext] "\t" ext
+      else if (lines > rec[ext]) print "⚠\t" path "\t" lines "\t" rec[ext] "\t" ext
+    }')
+  if [ -n "$report" ]; then
+    while IFS=$'\t' read -r mark path lines limit ext; do
+      [ -z "$mark" ] && continue
+      if [ "$mark" = "✗" ]; then
+        echo "[pre-commit] ✗ $path is $lines lines (hard limit: $limit for .$ext) — must split before committing"
+        FAIL=1
+      else
+        echo "[pre-commit] ⚠ $path is $lines lines (recommended: $limit for .$ext) — consider splitting"
+      fi
+    done <<< "$report"
   fi
-done <<< "$STAGED"
+fi
 
 # 9. Version-bump enforcement for apps that have a `version` in package.json.
 # Blocks the commit if app code changes without a corresponding version bump.
